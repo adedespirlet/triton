@@ -19,7 +19,7 @@ Reviewers: add rows for missing context. State is `todo`, `in progress` or
 | File | State | Note |
 |------|-------|------|
 | [`tiles_and_stages.md`](tiles_and_stages.md) | done | `BLOCK_M`/`BLOCK_N`/`BLOCK_K` and `num_stages`. Open: its "Not yet established" items. |
-| `warps_and_registers.md` | todo | `num_warps` and the AutoWS register budgets. |
+| [`warps_and_registers.md`](warps_and_registers.md) | done | `num_warps` and the AutoWS register budgets. Open: its "Not yet established" items. |
 | `epilogue.md` | todo | Epilogue subtiling, separate epilogue store, store placement. |
 | `2cta.md` | todo | 1-CTA vs 2-CTA (`two_ctas`). |
 | `data_partitioning.md` | todo | `data_partition_factor`. |
@@ -84,13 +84,13 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `warp_specialize` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
 | `data_partition_factor` | [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
 | `separate_epilogue_store` | — | mentioned |
-| `merge_epilogue` | — | todo |
-| `merge_epilogue_to_computation`, `merge_correction` | — | todo |
+| `merge_epilogue` | — | mentioned |
+| `merge_epilogue_to_computation`, `merge_correction` | — | mentioned |
 | `pingpongAutoWS` | — | todo |
 | `multi_cta` | — | todo |
-| `two_ctas` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem) | covered |
+| `two_ctas` | [resources.md](resources.md#never-try-any-problem); [tiles_and_stages.md](tiles_and_stages.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem) | covered |
 | `allowDependentTwoCTA` | — | todo |
-| `ctas_per_cga` | — | todo |
+| `ctas_per_cga` | — | mentioned |
 | Tile scheduler | — | todo |
 | `clc` | — | todo |
 | `tt.autows` stage/order | — | todo |
@@ -105,10 +105,10 @@ One row per entry in [knobs.md](knobs.md): where its when-to-use rules live. `co
 | `tma_store_pipelining` | — | todo |
 | `TRITON_WS_STAGING_COPIES` | [tiles_and_stages.md](tiles_and_stages.md#when-to-try-it-depends-on-the-problem) | covered |
 | `TRITON_WS_TMA_REDUCE_STAGING_COPIES` | — | todo |
-| `num_warps` | [resources.md](resources.md#never-try-any-problem) | covered |
-| `minRegAutoWS` | [resources.md](resources.md#never-try-any-problem) | covered |
-| `maxRegAutoWS` | [resources.md](resources.md#never-try-any-problem) | covered |
-| `maxnreg` | [resources.md](resources.md#when-to-try-it-depends-on-the-problem) | covered |
+| `num_warps` | [resources.md](resources.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem) | covered |
+| `minRegAutoWS` | [resources.md](resources.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem) | covered |
+| `maxRegAutoWS` | [resources.md](resources.md#never-try-any-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem) | covered |
+| `maxnreg` | [resources.md](resources.md#when-to-try-it-depends-on-the-problem); [warps_and_registers.md](warps_and_registers.md#never-try-any-problem) | covered |
 | `sched4reg`, `enable_tree_reduction` | — | todo |
 | `tmem_alloc_algo` | — | todo |
 | `smem_alloc_algo` | — | todo |
