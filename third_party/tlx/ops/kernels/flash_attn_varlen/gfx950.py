@@ -428,9 +428,12 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, sm_scal
             part, count = scratch
     n_items = bh * items_per_bh
     grid = (_run_length(n_items, max_splits) * 8, )
-    _flash_attn_varlen_fwd[grid](q, k, v, out, cu_seqlens_q, cu_seqlens_k, part, count, q.stride(0), q.stride(1),
-                                 k.stride(0), k.stride(1), v.stride(0), v.stride(1), out.stride(0), out.stride(1),
-                                 sm_scale * 1.4426950408889634, heads, heads // k.shape[1], num_m_blocks, items_per_bh,
-                                 n_items, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=head_dim, IS_CAUSAL=causal,
-                                 SPLIT=split, num_warps=NUM_WARPS, waves_per_eu=0, matrix_instr_nonkdim=16, kpack=1)
+    for _ in range(50):
+        _flash_attn_varlen_fwd[grid](q, k, v, out, cu_seqlens_q, cu_seqlens_k, part, count, q.stride(0), q.stride(1),
+                                     k.stride(0), k.stride(1), v.stride(0), v.stride(1), out.stride(0), out.stride(1),
+                                     sm_scale * 1.4426950408889634, heads, heads // k.shape[1], num_m_blocks,
+                                     items_per_bh, n_items, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=head_dim,
+                                     IS_CAUSAL=causal, SPLIT=split, num_warps=NUM_WARPS, waves_per_eu=0,
+                                     matrix_instr_nonkdim=16, kpack=1)
+    torch.cuda.synchronize()
     return out
