@@ -3094,6 +3094,15 @@ def _amd_sched_barrier_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
 
 
 @triton.jit
+def _amd_sched_group_barrier_kernel(x_ptr, y_ptr, MASK: tl.constexpr):
+    offsets = tl.arange(0, 64)
+    values = tl.load(x_ptr + offsets)
+    tlx.amd_sched_group_barrier(MASK, 1, 0)
+    tlx.amd_sched_group_barrier(0x402, 5, 0)
+    tl.store(y_ptr + offsets, values)
+
+
+@triton.jit
 def _amd_iglp_opt_kernel(x_ptr, y_ptr, VARIANT: tl.constexpr):
     offsets = tl.arange(0, 64)
     values = tl.load(x_ptr + offsets)
@@ -5861,6 +5870,39 @@ def test_amd_sched_barrier_compiles_gfx950():
         constexprs={"BLOCK": 64},
     )
     assert "llvm.amdgcn.sched.barrier" in compiled.asm["llir"]
+
+
+def test_amd_sched_group_barrier_compiles_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_sched_group_barrier_kernel,
+        signature={"x_ptr": "*bf16", "y_ptr": "*bf16", "MASK": "constexpr"},
+        constexprs={"MASK": 0x8},
+    )
+    llir = compiled.asm["llir"]
+    calls = re.findall(r"call void @llvm\.amdgcn\.sched\.group\.barrier\((i32 \d+, i32 \d+, i32 \d+)\)", llir)
+    assert calls == ["i32 8, i32 1, i32 0", "i32 1026, i32 5, i32 0"]
+
+
+@pytest.mark.parametrize("mask", [False, 8.0, -1, 0x1000])
+def test_amd_sched_group_barrier_rejects_invalid_mask(mask):
+    with triton.knobs.compilation.scope():
+        triton.knobs.compilation.always_compile = True
+        with pytest.raises(CompilationError, match="mask must"):
+            compile_for_gfx950(
+                _amd_sched_group_barrier_kernel,
+                signature={"x_ptr": "*bf16", "y_ptr": "*bf16", "MASK": "constexpr"},
+                constexprs={"MASK": mask},
+            )
+
+
+def test_amd_sched_group_barrier_rejects_cuda_backend():
+    with pytest.raises(CompilationError, match="only supported on AMD"):
+        compile_for_target(
+            _amd_sched_group_barrier_kernel,
+            signature={"x_ptr": "*bf16", "y_ptr": "*bf16", "MASK": "constexpr"},
+            constexprs={"MASK": 0x8},
+            target=GPUTarget("cuda", 90, 32),
+        )
 
 
 def test_amd_iglp_opt_compiles_gfx950():

@@ -364,6 +364,39 @@ def amd_sched_barrier(mask: tl.constexpr = 0, _semantic=None):
 
 
 @tl.builtin
+def amd_sched_group_barrier(mask: tl.constexpr, size: tl.constexpr, sync_id: tl.constexpr, _semantic=None):
+    """Emit LLVM's ``llvm.amdgcn.sched.group.barrier`` scheduling hint for AMD GPUs.
+
+    Forms a scheduling group of ``size`` instructions matching ``mask``, picked
+    bottom-up from this point in the LLVM scheduling region. Consecutive calls
+    sharing ``sync_id`` order their groups as written, so alternating calls
+    interleave instruction classes, e.g. ``(0x8, 1, 0)`` then ``(0x402, 5, 0)``
+    places one MFMA, then five VALU or transcendental instructions.
+
+    ``mask`` bits: 0x1 all non-memory ALU, 0x2 VALU, 0x4 SALU, 0x8 MFMA/WMMA,
+    0x10 all VMEM, 0x20 VMEM read, 0x40 VMEM write, 0x80 all DS, 0x100 DS read,
+    0x200 DS write, 0x400 transcendental, 0x800 LDSDMA.
+
+    Do not mix with :func:`amd_iglp_opt` in the same region. This hint adds no
+    memory or workgroup synchronization.
+
+    See `LLVM AMDGPU intrinsics
+    <https://llvm.org/docs/AMDGPUUsage.html#llvm-ir-intrinsics>`_.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_sched_group_barrier is only supported on AMD (HIP) backends")
+    mask = tl._unwrap_if_constexpr(mask)
+    size = tl._unwrap_if_constexpr(size)
+    sync_id = tl._unwrap_if_constexpr(sync_id)
+    for name, value in (("mask", mask), ("size", size), ("sync_id", sync_id)):
+        assert isinstance(value, int) and not isinstance(value, bool), f"{name} must be a constexpr integer"
+    assert 0 <= mask <= 0xFFF, f"mask must use only AMD scheduling-class bits 0..11, got {mask:#x}"
+    assert 0 <= size < 2**31, f"size must be a non-negative 32-bit integer, got {size}"
+    assert 0 <= sync_id < 2**31, f"sync_id must be a non-negative 32-bit integer, got {sync_id}"
+    _semantic.builder.create_amd_sched_group_barrier(mask, size, sync_id)
+
+
+@tl.builtin
 def amd_iglp_opt(variant: tl.constexpr, _semantic=None):
     """Emit LLVM's ``llvm.amdgcn.iglp.opt`` scheduling hint for AMD GPUs.
 
