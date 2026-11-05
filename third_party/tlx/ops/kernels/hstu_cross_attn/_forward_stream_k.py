@@ -233,6 +233,33 @@ def _lazy_step(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, str
         state = state.rescale_lazy(delta_c, advance_c)
     return state, p_c, kt_dot
 
+@triton.jit
+def _lazy_step2(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, stride_kn, stride_vn,
+               QK_SCALE: tl.constexpr, BLOCK_N: tl.constexpr, CUR_SLOT: tl.constexpr, NEXT_SLOT: tl.constexpr,
+               RESCALE_THRESHOLD: tl.constexpr):
+    """`_attn_inner_pipelined_lazy_step` (split VEC1, PV-woven VEC1) with the cheaper row max, and fp32 row sums
+    for fp16 as well as bf16."""
+    with tlx.warp_pipeline_stage("dot1"):
+        qk = _qk_pieces(q, kt_dot)
+        state, p_dot = _lazy_vec2(state, p_c, QK_SCALE, q.dtype, LAZY_EXP_PV)
+        _weave_softmax(1)
+    tlx.async_load_wait_group(3)
+    with tlx.warp_pipeline_stage("mem1"):
+        v_dot = tlx.local_load(tlx.local_view(v_buf, CUR_SLOT), relaxed=True)
+        tok_v = tlx.async_load(v_ptrs + (block_n + 2) * BLOCK_N * stride_vn, tlx.local_view(v_buf, CUR_SLOT))
+        tlx.async_load_commit_group([tok_v])
+    with tlx.warp_pipeline_stage("dot2"):
+        state, p_c, delta_c, advance_c = _dot_pv_vec1_lazy(state, p_dot, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
+        p_c = _hold_exp(p_c)
+        _weave_softmax(2)
+    tlx.async_load_wait_group(3)
+    with tlx.warp_pipeline_stage("mem2"):
+        kt_dot = _kt_pieces(k_buf, CUR_SLOT)
+        tok_k = tlx.async_load(k_ptrs + (block_n + 3) * BLOCK_N * stride_kn, tlx.local_view(k_buf, NEXT_SLOT))
+        tlx.async_load_commit_group([tok_k])
+        state = state.rescale_lazy(delta_c, advance_c)
+    tlx.async_load_wait_group(1)
+    return state, p_c, kt_dot
 
 @triton.jit
 def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, stride_kn, stride_vn,
@@ -242,22 +269,25 @@ def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, str
     # A commit group is every copy issued since the previous commit, whatever tokens it is given.
     tok_k0 = tlx.async_load(k_ptrs, tlx.local_view(k_buf, 0))
     tlx.async_load_commit_group([tok_k0])
+
     tok_v0 = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0))
     tlx.async_load_commit_group([tok_v0])
     tok_k1 = tlx.async_load(k_ptrs + BLOCK_N * stride_kn, tlx.local_view(k_buf, 1))
     tlx.async_load_commit_group([tok_k1])
+   
 
     wait0 = tlx.async_load_wait_group(2)
     q = tlx.local_load(tlx.local_view(q_buf, 0), token=wait0)
     kt0 = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, 0)), token=wait0, relaxed=True)
     qk = tl.dot(q, kt0)
+
     state, p_c, _, _ = _vec1_lazy_split(state, qk, QK_SCALE, RESCALE_THRESHOLD)
     # The first frame starts from an empty accumulator, so its correction is a zero denominator.
     state = SoftmaxState(state.acc, tl.zeros([q.shape[0]], tl.float32), state.m_i)
     tl.debug_barrier()
     tok_k2 = tlx.async_load(k_ptrs + 2 * BLOCK_N * stride_kn, tlx.local_view(k_buf, 0))
     tlx.async_load_commit_group([tok_k2])
-    wait1 = tlx.async_load_wait_group(1)
+    wait1 = tlx.async_load_wait_group(2)
     kt_dot = _kt_pieces(k_buf, 1, wait1)
     tok_v1 = tlx.async_load(v_ptrs + BLOCK_N * stride_vn, tlx.local_view(v_buf, 1))
     tlx.async_load_commit_group([tok_v1])
@@ -265,9 +295,9 @@ def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, str
     # Pairs keep both ring slots static.
     for pair_idx in tl.range(0, (n_blocks - 3) // 2, num_stages=1):
         block_n = pair_idx * 2
-        state, p_c, kt_dot = _lazy_step(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, stride_kn,
+        state, p_c, kt_dot = _lazy_step2(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, stride_kn,
                                         stride_vn, QK_SCALE, BLOCK_N, 0, 1, RESCALE_THRESHOLD)
-        state, p_c, kt_dot = _lazy_step(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n + 1, k_buf, v_buf, stride_kn,
+        state, p_c, kt_dot = _lazy_step2(state, p_c, q, kt_dot, k_ptrs, v_ptrs, block_n + 1, k_buf, v_buf, stride_kn,
                                         stride_vn, QK_SCALE, BLOCK_N, 1, 0, RESCALE_THRESHOLD)
     # Drain the last three blocks without further prefetches.
     nm1 = n_blocks - 1
