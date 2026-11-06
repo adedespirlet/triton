@@ -29,6 +29,12 @@ struct ExtractSliceOpConversion
     auto *ctx = rewriter.getContext();
     auto srcTy = cast<RankedTensorType>(op.getSource().getType());
     auto dstTy = cast<RankedTensorType>(op.getType());
+    if (!isa_and_nonnull<triton::gpu::DistributedEncodingTrait>(
+            srcTy.getEncoding()))
+      return op.emitOpError("requires a distributed source layout");
+    if (!isa_and_nonnull<triton::gpu::DistributedEncodingTrait>(
+            dstTy.getEncoding()))
+      return op.emitOpError("requires a distributed result layout");
     auto vals = unpackUniqueTensorElements(loc, adaptor.getSource(), rewriter);
     auto offsets = op.getStaticOffsets();
 

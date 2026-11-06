@@ -199,6 +199,10 @@ void init_triton_tlx_ir(py::module_ &m) {
                throw std::runtime_error(
                    "amd_extract_slice: shape and offsets must match source "
                    "rank");
+             if (!isa_and_nonnull<triton::gpu::DistributedEncodingTrait>(
+                     sourceType.getEncoding()))
+               throw std::runtime_error(
+                   "amd_extract_slice: requires a distributed source layout");
              auto resultType = RankedTensorType::get(
                  shape, sourceType.getElementType(), sourceType.getEncoding());
              auto offsetsAttr = self.getBuilder().getDenseI64ArrayAttr(offsets);
