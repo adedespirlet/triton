@@ -311,7 +311,13 @@ def _mfma_softmax_loop_4w(
     qk_scale,
     FAST_EXP: tl.constexpr,
 ):
-    """An item's middle tiles, two per iteration.
+    """Main loop of the online-softmax attention over a work item's 128-key
+    tiles. Each step computes the scores QK^T of the next tile, adds P V of
+    the current tile into the output accumulator, and updates the softmax
+    with the new scores (running row max and row sum, rescaling the
+    accumulator). The kernel's prologue computes QK^T and the softmax of the
+    first tile and its epilogue finishes the last two tiles; this loop covers
+    the tiles in between, two per iteration, one from each LDS slot.
 
     On entry P holds tile 0 and LDS slot 0 holds K tile 1 and V tile 0. Each
     stage takes QK of the next tile and PV of the current one from one slot
@@ -457,15 +463,17 @@ def _mfma_softmax_loop_8w(
     qk_scale,
     FAST_EXP: tl.constexpr,
 ):
-    """_mfma_softmax_loop_4w as a two-stage pipeline, same entry and exit.
+    """Main loop of the online-softmax attention over a work item's 128-key
+    tiles. Each step computes the scores QK^T of the next tile, adds P V of
+    the current tile into the output accumulator, and updates the softmax
+    with the new scores (running row max and row sum, rescaling the
+    accumulator). The kernel's prologue computes QK^T and the softmax of the
+    first tile and its epilogue finishes the last two tiles; this loop covers
+    the tiles in between, two per iteration, one from each LDS slot.
 
-    Waves 0-3 and waves 4-7 run one stage apart, so one half's softmax update
-    overlaps the other half's MFMAs. A slot is refilled in the MFMA stage
-    after the one that reads it, and every wave waits for its copies before
-    leaving that stage: when either half reads a tile, all eight waves'
-    copies of it have landed, and no wave refills a slot the other half is
-    still reading. The MFMA stage itself issues no wait (CALLER_WAITS); the
-    tiles the first one reads are the caller's to wait for."""
+    The eight waves split into two halves of four: waves 0-3 and waves 4-7
+    run one stage apart, so one half's softmax update overlaps the other
+    half's MFMAs."""
     MFMA_PRIORITY: tl.constexpr = 0
     SOFTMAX_PRIORITY: tl.constexpr = 1
     OFF: tl.constexpr = core._score_offset(FAST_EXP)
@@ -770,10 +778,8 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
     acc2 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
     acc3 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
     if PIPELINED:
-        # The next MFMA stage reads K tile 1 and V tile 0 without a wait.
         tlx.async_load_wait_group(0)
     else:
-        # K tile 0 is in slot 1; only slot 0's two groups may be outstanding.
         tlx.async_load_wait_group(2)
     s0, s1 = core._qk_first(q_lo, q_hi, qs_lo, qs_hi, ka[1], kb[1], ksa[1], ksb[1], qk_scale)
     s0, s1 = _mask_front(s0, s1, front)
@@ -1481,7 +1487,6 @@ def _launch_extended_forward(
 ):
     """Launch the attention kernel. Returns (out, lse). ``q`` is BF16, or E4M3
     with ``q_scales`` when ``prequantized``."""
-    eight_waves = block_m == 256
     batch = cu_seqlens_k.numel() - 1
     out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
     lse = torch.empty((_HEADS, q.shape[0]), dtype=torch.float32, device=q.device)
@@ -1496,11 +1501,8 @@ def _launch_extended_forward(
         q_scales if q_scales is not None else q,
         k8,
         v8,
-        # Eight waves get int32 views of the packed E8M0 scale words: behind
-        # the kernel's pointer cast their copies are not buffer loads, which
-        # costs 14% on short K/V. Four waves measure the same either way.
-        ks.view(torch.int32) if eight_waves else ks,
-        vs.view(torch.int32) if eight_waves else vs,
+        ks.view(torch.int32),
+        vs.view(torch.int32),
         out,
         lse,
         cu_seqlens_q,
