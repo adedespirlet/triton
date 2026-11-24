@@ -1463,8 +1463,8 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seq
 
 
 def flash_attn_varlen_mxfp8(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=None,
-                            causal=False, *, fast_exp=None, space=None):
-    """Forward-only packed MXFP8 attention using the gfx950 4-wave kernel.
+                            causal=False, *, fast_exp=None, block_m=128, space=None):
+    """Forward-only packed MXFP8 attention using the gfx950 4- or 8-wave kernel.
 
     Q/K/V are contiguous BF16 ``(tokens, 4, 128)`` tensors. Sequence ``b`` owns
     query rows ``cu_seqlens_q[b]:cu_seqlens_q[b + 1]`` and key/value rows
@@ -1473,10 +1473,12 @@ def flash_attn_varlen_mxfp8(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
     four heads. ``max_seqlen_q`` and ``max_seqlen_k`` are accepted for API
     parity. ``sm_scale`` defaults to ``128**-0.5`` and ``fast_exp`` selects the
     approximate exponentiation path; by default it is used when the sequences
-    average at least 4096 keys. In-place changes to the offset tensors are
-    picked up when PyTorch records them; writes through ``.data`` are not.
-    Returns the BF16 output only (no log-sum-exp); query rows of a sequence
-    with no keys are zero.
+    average at least 4096 keys. ``block_m`` is the query-tile size: 128 rows
+    on four waves, or 256 on eight, which is faster when the query lengths
+    are close to multiples of 256; the output is the same. In-place changes
+    to the offset tensors are picked up when PyTorch records them; writes
+    through ``.data`` are not. Returns the BF16 output only (no log-sum-exp);
+    query rows of a sequence with no keys are zero.
     """
     import torch
 
@@ -1496,6 +1498,8 @@ def flash_attn_varlen_mxfp8(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
         raise InvalidInput("tlx.ops.flash_attn_varlen_mxfp8 expects all tensors on one device")
     if sm_scale is not None and not 0 < sm_scale < math.inf:
         raise InvalidInput("tlx.ops.flash_attn_varlen_mxfp8 expects a positive finite sm_scale")
+    if block_m not in (128, 256):
+        raise InvalidInput("tlx.ops.flash_attn_varlen_mxfp8 expects block_m 128 or 256")
     space_name, invariance = _normalize_space_arg("flash_attn_varlen_mxfp8", space)
     _check_single_config_space("flash_attn_varlen_mxfp8", space_name)
     fn, spec = impl_for("flash_attn_varlen_mxfp8", device=q.device)
@@ -1504,7 +1508,8 @@ def flash_attn_varlen_mxfp8(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
     _check_enforced("flash_attn_varlen_mxfp8", spec, invariance)
     scale = 128**-0.5 if sm_scale is None else sm_scale
     with torch.cuda.device(q.device):
-        return fn(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), int(max_seqlen_k), scale, fast_exp=fast_exp)
+        return fn(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), int(max_seqlen_k), scale, fast_exp=fast_exp,
+                  block_m=block_m)
 
 
 def _check_lora(name, proj, d_model, out_features):

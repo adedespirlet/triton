@@ -1,6 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
-"""Scaled-MFMA MXFP8 attention building blocks for the gfx950 4-wave kernel.
+"""Scaled-MFMA MXFP8 attention building blocks for the gfx950 4- and 8-wave kernels.
 
 One warp covers 32 query rows; each 128-key tile is two 64-key halves.
 Q and K carry one E8M0 scale per 32x32 (row, feature) tile, V one per
@@ -341,6 +341,7 @@ def _mfma_stage(
     v_n1,
     ks_n1,
     rem=None,
+    CALLER_WAITS: tl.constexpr = False,
 ):
     # QK(j + 1) and PV(j) with operands read from LDS in MFMA-sized pieces. Each
     # read is issued right after the MFMA that frees the previous piece and is
@@ -358,7 +359,8 @@ def _mfma_stage(
     # first halves land. The stage then issues two more groups, K tile kt and
     # V tile vt into the other slot (kd_*, vd_*, ksd_*, vsd_*) through
     # _issue_tile, so the wait for two outstanding groups ahead of the second
-    # halves' reads lets those land.
+    # halves' reads lets those land. With CALLER_WAITS the stage issues neither
+    # wait: the caller has waited for both halves.
     #
     # P's row sums go first: they need only registers, so the matrix cores get
     # work as the stage starts, and the first reads and the next tile's
@@ -380,7 +382,8 @@ def _mfma_stage(
     # Triton TR011: FP8 operands do not use the TF32 input mode.
     t0 = tl.dot(  # noqa: TR011
         _as_rowsum_a(p0[0]), ones, tl.zeros([q_lo.shape[0] // 2, 16], dtype=tl.float32))
-    tlx.async_load_wait_group(1)
+    if not CALLER_WAITS:
+        tlx.async_load_wait_group(1)
     kA0 = _ld_k(ka, 0)
     sA0, sA1 = _ld_ks(ksa)
     vA0 = _ld_v(va, 0)
@@ -428,7 +431,8 @@ def _mfma_stage(
     vA3 = _ld_v(va, 3)
     tlx.amd_sched_barrier(0)
     acc2 = _pv(p0, vA2, vsA2, acc2)
-    tlx.async_load_wait_group(2)
+    if not CALLER_WAITS:
+        tlx.async_load_wait_group(2)
     kB0 = _ld_k(kb, 0)
     sB0, sB1 = _ld_ks(ksb)
     tlx.amd_sched_barrier(0)

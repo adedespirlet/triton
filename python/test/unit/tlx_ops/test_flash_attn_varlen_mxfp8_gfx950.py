@@ -51,10 +51,14 @@ def _reference(q, k, v, cu_q, cu_k, scale):
         ([128, 0, 320], [0, 300, 100], False),
         # Maximal padding: the padded sequences fill the K/V buffers exactly.
         ([64, 200], [257, 1], False),
+        # Query lengths at multiples of 256, the 8-wave kernel's case.
+        ([256, 768, 512], [300, 2000, 5000], False),
     ],
 )
-def test_flash_attn_varlen_mxfp8_four_wave(lens_q, lens_k, fast_exp):
-    """The public op against FP32 attention over ragged and empty sequences."""
+@pytest.mark.parametrize("block_m", [128, 256])
+def test_flash_attn_varlen_mxfp8_forward(lens_q, lens_k, fast_exp, block_m):
+    """The public op on four and eight waves against FP32 attention over
+    ragged and empty sequences."""
     from triton.tlx.ops import flash_attn_varlen_mxfp8
 
     torch.manual_seed(20)
@@ -72,13 +76,15 @@ def test_flash_attn_varlen_mxfp8_four_wave(lens_q, lens_k, fast_exp):
         max(lens_k),
         causal=False,
         fast_exp=fast_exp,
+        block_m=block_m,
     )
     ref, _ = _reference(q, k, v, cu_q, cu_k, 128**-0.5)
     assert out.shape == q.shape and out.dtype == q.dtype
     torch.testing.assert_close(out.float(), ref, atol=0.08, rtol=0.08)
 
 
-def test_flash_attn_varlen_mxfp8_prequantized():
+@pytest.mark.parametrize("block_m", [128, 256])
+def test_flash_attn_varlen_mxfp8_prequantized(block_m):
     """Q quantized ahead of time gives the same bits as Q quantized in the kernel."""
     from triton.tlx.ops.kernels.flash_attn_varlen_mxfp8 import gfx950
 
@@ -92,14 +98,46 @@ def test_flash_attn_varlen_mxfp8_prequantized():
 
     q_state = gfx950.prepare_q(q, cu_q)
     kv_state = gfx950.prepare_kv(k, v, cu_k)
-    out_pre, lse_pre = gfx950.forward_prequantized(q_state, kv_state, cu_q, cu_k, scale)
-    out, lse, _ = gfx950.forward(q, k, v, cu_q, cu_k, scale)
+    out_pre, lse_pre = gfx950.forward_prequantized(q_state, kv_state, cu_q, cu_k, scale, block_m=block_m)
+    out, lse, _ = gfx950.forward(q, k, v, cu_q, cu_k, scale, block_m=block_m)
     ref, ref_lse = _reference(q, k, v, cu_q, cu_k, scale)
 
     torch.testing.assert_close(out_pre, out, atol=0, rtol=0)
     torch.testing.assert_close(lse_pre, lse, atol=0, rtol=0)
     torch.testing.assert_close(out.float(), ref, atol=0.08, rtol=0.08)
     torch.testing.assert_close(lse, ref_lse, atol=0.25, rtol=0.05)
+
+
+@pytest.mark.parametrize(
+    "lens_q,lens_k",
+    [
+        # Query lengths at multiples of 256, and a partial 256-row tile.
+        ([256, 512, 320], [300, 2000, 90]),
+        # Long sequences, with the approximate exponential by default.
+        ([768, 256], [4096, 5000]),
+        # Queries with no keys, keys with no queries, and empty sequences.
+        ([0, 256, 128, 0], [300, 0, 100, 0]),
+    ],
+)
+def test_flash_attn_varlen_mxfp8_eight_wave_matches_four_wave(lens_q, lens_k):
+    """The 8-wave kernel gives the 4-wave kernel's bits from the same K/V
+    state, the tile size only choosing the kernel."""
+    from triton.tlx.ops.kernels.flash_attn_varlen_mxfp8 import gfx950
+
+    torch.manual_seed(20)
+    q = torch.randn(sum(lens_q), 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(lens_k), 4, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    cu_q, cu_k = _cu(lens_q), _cu(lens_k)
+    scale = 128**-0.5
+
+    out, lse, kv_state = gfx950.forward(q, k, v, cu_q, cu_k, scale)
+    out8, lse8, _ = gfx950.forward(q, k, v, cu_q, cu_k, scale, kv_state=kv_state, block_m=256)
+    torch.testing.assert_close(out8, out, atol=0, rtol=0)
+    torch.testing.assert_close(lse8, lse, atol=0, rtol=0)
+    ref, ref_lse = _reference(q, k, v, cu_q, cu_k, scale)
+    torch.testing.assert_close(out8.float(), ref, atol=0.08, rtol=0.08)
+    torch.testing.assert_close(lse8, ref_lse, atol=0.25, rtol=0.05)
 
 
 @pytest.mark.parametrize("lens_k,fast", [([384, 640], False), ([4096, 5000], True)])
@@ -169,8 +207,9 @@ def test_flash_attn_varlen_mxfp8_prepared_state_follows_offsets():
     torch.testing.assert_close(lse, ref_lse, atol=0.25, rtol=0.05)
 
 
+@pytest.mark.parametrize("block_m", [128, 256])
 @pytest.mark.parametrize("seen_before", [False, True])
-def test_flash_attn_varlen_mxfp8_graph_replay_follows_offsets(seen_before):
+def test_flash_attn_varlen_mxfp8_graph_replay_follows_offsets(seen_before, block_m):
     """A CUDA graph is captured once, then replayed after the offset tensors
     are overwritten with another batch's offsets: the replay must give that
     batch's result. Run with and without an earlier call on the same offset
@@ -192,14 +231,14 @@ def test_flash_attn_varlen_mxfp8_graph_replay_follows_offsets(seen_before):
         torch.testing.assert_close(lse, ref_lse, atol=0.25, rtol=0.05)
 
     # Compile every kernel on other offset tensors.
-    gfx950.forward(q, k, v, _cu(second[0]), _cu(second[1]), scale)
+    gfx950.forward(q, k, v, _cu(second[0]), _cu(second[1]), scale, block_m=block_m)
     cu_q, cu_k = _cu(first[0]), _cu(first[1])
     if seen_before:
-        gfx950.forward(q, k, v, cu_q, cu_k, scale)
+        gfx950.forward(q, k, v, cu_q, cu_k, scale, block_m=block_m)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        out, lse, _ = gfx950.forward(q, k, v, cu_q, cu_k, scale)
-    check(*gfx950.forward(q, k, v, cu_q, cu_k, scale)[:2])
+        out, lse, _ = gfx950.forward(q, k, v, cu_q, cu_k, scale, block_m=block_m)
+    check(*gfx950.forward(q, k, v, cu_q, cu_k, scale, block_m=block_m)[:2])
     graph.replay()
     check(out, lse)
     cu_q.copy_(_cu(second[0]))
@@ -208,8 +247,9 @@ def test_flash_attn_varlen_mxfp8_graph_replay_follows_offsets(seen_before):
     check(out, lse)
 
 
+@pytest.mark.parametrize("block_m", [128, 256])
 @pytest.mark.parametrize("batch", [37, 300])
-def test_flash_attn_varlen_mxfp8_dispatch_order(batch):
+def test_flash_attn_varlen_mxfp8_dispatch_order(batch, block_m):
     """The dispatch tables built on the device. Every query tile of every
     sequence appears exactly once in the queue. The queue's two halves, the
     classes that the XCDs share out, carry about the same work. Each half
@@ -221,10 +261,10 @@ def test_flash_attn_varlen_mxfp8_dispatch_order(batch):
     lens_q = torch.randint(0, 400, (batch, ), generator=generator).tolist()
     lens_k = torch.randint(0, 3000, (batch, ), generator=generator).tolist()
     lens_q[3], lens_k[5], lens_k[6] = 0, 0, lens_k[7]
-    meta = gfx950._build_metadata(_cu(lens_q), _cu(lens_k), sum(lens_q), sum(lens_k), 128, 256)
+    meta = gfx950._build_metadata(_cu(lens_q), _cu(lens_k), sum(lens_q), sum(lens_k), block_m, 256)
     start = meta["q_tile_start"].tolist()
     sizes = start[batch:]
-    tiles = [-(-q // 128) for q in lens_q]
+    tiles = [-(-q // block_m) for q in lens_q]
     assert sum(sizes) == sum(tiles) and max(sizes) <= meta["class_capacity"]
 
     owner = meta["item_tile"][:sum(sizes)].tolist()
@@ -260,6 +300,8 @@ def test_flash_attn_varlen_mxfp8_rejects_invalid_inputs():
     empty_offsets = torch.empty(0, device="cuda", dtype=torch.int32)
     with pytest.raises(InvalidInput, match="sequence offsets"):
         flash_attn_varlen_mxfp8(q, k, k, empty_offsets, empty_offsets, 8, 16)
+    with pytest.raises(InvalidInput, match="block_m"):
+        flash_attn_varlen_mxfp8(q, k, k, cu_q, cu_k, 8, 16, block_m=64)
 
     from triton.tlx.ops.kernels.flash_attn_varlen_mxfp8 import gfx950
 
@@ -267,3 +309,5 @@ def test_flash_attn_varlen_mxfp8_rejects_invalid_inputs():
         gfx950.forward(q, k, k, cu_q.long(), cu_k, 128**-0.5)
     with pytest.raises(ValueError, match="same shape"):
         gfx950.forward(q, k, k, cu_q, _cu([8, 8]), 128**-0.5)
+    with pytest.raises(ValueError, match="block_m"):
+        gfx950.forward(q, k, k, cu_q, cu_k, 128**-0.5, block_m=64)

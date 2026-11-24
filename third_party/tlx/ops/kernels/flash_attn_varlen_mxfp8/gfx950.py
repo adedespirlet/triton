@@ -1,6 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
-"""Packed-varlen MXFP8 attention forward on the 4-wave scaled-MFMA core.
+"""Packed-varlen MXFP8 attention forward on the 4- and 8-wave scaled-MFMA cores.
 
 Packed [tokens, 4, 128] BF16 Q/K/V, non-causal. One preparation kernel
 quantizes K and V into head-major buffers in which every sequence owns a span
@@ -11,7 +11,12 @@ in registers, or ahead of time for ``forward_prequantized``. The padding sits
 at both ends of a span (see ``_front``), so only an item's first and last
 128-key tiles hold padding keys, which get scores of -1e30 or less.
 
-Work items are 128-row query-tile/head pairs, one per workgroup. Their number
+Work items are query-tile/head pairs, one per workgroup. A query tile has
+``block_m`` rows, one wave per 32: 128 rows run on four waves, 256 on eight,
+whose two halves run the tile loop as a two-stage pipeline one stage apart.
+Every wave computes its 32 rows whether or not they exist, so 256 rows pay
+off when the query lengths are close to multiples of 256; the caller
+chooses. Both read the same prepared K/V state. The number of work items
 depends on every sequence's length, so the launch grid is an upper bound of
 it, computed from the total number of query rows and the batch size; the
 workgroups past the last item exit at once. Device kernels build the tables
@@ -48,6 +53,9 @@ from . import mxfp8_attention_core_gfx950 as core
 
 _HEADS = 4
 _HEAD_DIM = 128
+# Query-tile rows per work item, one wave per 32: 128 selects the 4-wave
+# kernel, the default, and 256 the 8-wave one.
+_BLOCK_MS = (128, 256)
 _BLOCK_M = 128
 # Sequences averaging at least this many keys are long: the approximate
 # exponential is then the default.
@@ -419,6 +427,163 @@ def _mfma_softmax_loop_4w(
 
 
 @triton.jit
+def _mfma_softmax_loop_8w(
+    q_lo,
+    q_hi,
+    qs_lo,
+    qs_hi,
+    ka,
+    kb,
+    ksa,
+    ksb,
+    va,
+    vb,
+    vsa,
+    vsb,
+    s0,
+    s1,
+    p0,
+    p1,
+    m_i,
+    l_i,
+    acc0,
+    acc1,
+    acc2,
+    acc3,
+    n_tiles,
+    k_ptr,
+    v_ptr,
+    ks_ptr,
+    vs_ptr,
+    c_qk,
+    qk_scale,
+    FAST_EXP: tl.constexpr,
+):
+    """_mfma_softmax_loop_4w as a two-stage pipeline, same entry and exit.
+
+    Waves 0-3 and waves 4-7 run one stage apart, so one half's softmax update
+    overlaps the other half's MFMAs. A slot is refilled in the MFMA stage
+    after the one that reads it, and every wave waits for its copies before
+    leaving that stage: when either half reads a tile, all eight waves'
+    copies of it have landed, and no wave refills a slot the other half is
+    still reading. The MFMA stage itself issues no wait (CALLER_WAITS); the
+    tiles the first one reads are the caller's to wait for."""
+    MFMA_PRIORITY: tl.constexpr = 0
+    SOFTMAX_PRIORITY: tl.constexpr = 1
+    OFF: tl.constexpr = core._score_offset(FAST_EXP)
+    HN: tl.constexpr = 64
+    D: tl.constexpr = 128
+    k_step = 128 * D
+    v_step = 128 * D
+    ks_step = 128
+    k_n1 = HN * D
+    v_n1 = HN * D
+    ks_n1 = HN
+    for it in tl.range(0, (n_tiles - 2) // 2, num_stages=1):
+        with tlx.warp_pipeline_stage("mfma", priority=MFMA_PRIORITY):
+            t = 2 * it + 2
+            s0, s1, acc0, acc1, acc2, acc3, l_i = core._mfma_stage(
+                q_lo,
+                q_hi,
+                qs_lo,
+                qs_hi,
+                ka[0],
+                kb[0],
+                ksa[0],
+                ksb[0],
+                va[0],
+                vb[0],
+                vsa[0],
+                vsb[0],
+                p0,
+                p1,
+                acc0,
+                acc1,
+                acc2,
+                acc3,
+                l_i,
+                (OFF - m_i) * c_qk,
+                qk_scale,
+                k_ptr,
+                v_ptr,
+                ks_ptr,
+                vs_ptr,
+                ka[1],
+                kb[1],
+                va[1],
+                vb[1],
+                ksa[1],
+                ksb[1],
+                vsa[1],
+                vsb[1],
+                t,
+                t - 1,
+                k_step,
+                v_step,
+                ks_step,
+                k_n1,
+                v_n1,
+                ks_n1,
+                CALLER_WAITS=True,
+            )
+        tlx.async_load_wait_group(0)
+        with tlx.warp_pipeline_stage("softmax", priority=SOFTMAX_PRIORITY):
+            p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale,
+                                                                     FAST_EXP)
+        with tlx.warp_pipeline_stage("mfma", priority=MFMA_PRIORITY):
+            t = 2 * it + 3
+            s0, s1, acc0, acc1, acc2, acc3, l_i = core._mfma_stage(
+                q_lo,
+                q_hi,
+                qs_lo,
+                qs_hi,
+                ka[1],
+                kb[1],
+                ksa[1],
+                ksb[1],
+                va[1],
+                vb[1],
+                vsa[1],
+                vsb[1],
+                p0,
+                p1,
+                acc0,
+                acc1,
+                acc2,
+                acc3,
+                l_i,
+                (OFF - m_i) * c_qk,
+                qk_scale,
+                k_ptr,
+                v_ptr,
+                ks_ptr,
+                vs_ptr,
+                ka[0],
+                kb[0],
+                va[0],
+                vb[0],
+                ksa[0],
+                ksb[0],
+                vsa[0],
+                vsb[0],
+                t,
+                t - 1,
+                k_step,
+                v_step,
+                ks_step,
+                k_n1,
+                v_n1,
+                ks_n1,
+                CALLER_WAITS=True,
+            )
+        tlx.async_load_wait_group(0)
+        with tlx.warp_pipeline_stage("softmax", priority=SOFTMAX_PRIORITY):
+            p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale,
+                                                                     FAST_EXP)
+    return s0, s1, p0, p1, m_i, l_i, acc0, acc1, acc2, acc3
+
+
+@triton.jit
 def _item_uniform(tile, ItemTile, QTileStart, CuQ, CuKV, CuPad, BLOCK_M: tl.constexpr):
     # Work-item metadata is loaded from memory, which leaves each scalar (and
     # every loop bound and offset derived from it) in a VGPR. The values are
@@ -459,7 +624,8 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
     FAST_EXP: tl.constexpr,
     PREQUANTIZED_Q: tl.constexpr,
 ):
-    """4-wave forward of one work item, a head of a query tile, per workgroup.
+    """Forward of one work item, a head of a query tile, per workgroup, on one
+    wave per 32 query rows.
 
     Q is BF16 and quantized here, or with PREQUANTIZED_Q E4M3 with its E8M0
     bytes in QScales. K8, V8, KS and VS are prepare_kv's buffers, and CuPad,
@@ -476,7 +642,10 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
     The item's tiles alternate between two LDS slots. QK of tile 0 comes first,
     masked ahead of the sequence start, then core._mfma_stage takes QK of tile
     j + 1 with PV of tile j for every later tile, the last one masked past the
-    sequence end, and core._pv_last closes with PV of the last tile."""
+    sequence end, and core._pv_last closes with PV of the last tile. On eight
+    waves (BLOCK_M 256) the middle tiles run as a two-stage pipeline, see
+    _mfma_softmax_loop_8w."""
+    PIPELINED: tl.constexpr = tlx.num_warps() == 8
     HN: tl.constexpr = 64
     HD: tl.constexpr = 64
     D: tl.constexpr = 128
@@ -602,43 +771,81 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
     acc1 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
     acc2 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
     acc3 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
-    # K tile 0 is in slot 1; only slot 0's two groups may be outstanding.
-    tlx.async_load_wait_group(2)
+    if PIPELINED:
+        # The next MFMA stage reads K tile 1 and V tile 0 without a wait.
+        tlx.async_load_wait_group(0)
+    else:
+        # K tile 0 is in slot 1; only slot 0's two groups may be outstanding.
+        tlx.async_load_wait_group(2)
     s0, s1 = core._qk_first(q_lo, q_hi, qs_lo, qs_hi, ka[1], kb[1], ksa[1], ksb[1], qk_scale)
     s0, s1 = _mask_front(s0, s1, front)
     p0, p1, m_i, l_i = core._softmax_first(s0, s1, FAST_EXP)
-    s0, s1, p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = _mfma_softmax_loop_4w(
-        q_lo,
-        q_hi,
-        qs_lo,
-        qs_hi,
-        ka,
-        kb,
-        ksa,
-        ksb,
-        va,
-        vb,
-        vsa,
-        vsb,
-        s0,
-        s1,
-        p0,
-        p1,
-        m_i,
-        l_i,
-        acc0,
-        acc1,
-        acc2,
-        acc3,
-        n_tiles,
-        k_ptr,
-        v_ptr,
-        ks_ptr,
-        vs_ptr,
-        c_qk,
-        qk_scale,
-        FAST_EXP=FAST_EXP,
-    )
+    if PIPELINED:
+        s0, s1, p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = _mfma_softmax_loop_8w(
+            q_lo,
+            q_hi,
+            qs_lo,
+            qs_hi,
+            ka,
+            kb,
+            ksa,
+            ksb,
+            va,
+            vb,
+            vsa,
+            vsb,
+            s0,
+            s1,
+            p0,
+            p1,
+            m_i,
+            l_i,
+            acc0,
+            acc1,
+            acc2,
+            acc3,
+            n_tiles,
+            k_ptr,
+            v_ptr,
+            ks_ptr,
+            vs_ptr,
+            c_qk,
+            qk_scale,
+            FAST_EXP=FAST_EXP,
+        )
+    else:
+        s0, s1, p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = _mfma_softmax_loop_4w(
+            q_lo,
+            q_hi,
+            qs_lo,
+            qs_hi,
+            ka,
+            kb,
+            ksa,
+            ksb,
+            va,
+            vb,
+            vsa,
+            vsb,
+            s0,
+            s1,
+            p0,
+            p1,
+            m_i,
+            l_i,
+            acc0,
+            acc1,
+            acc2,
+            acc3,
+            n_tiles,
+            k_ptr,
+            v_ptr,
+            ks_ptr,
+            vs_ptr,
+            c_qk,
+            qk_scale,
+            FAST_EXP=FAST_EXP,
+        )
     # The last stage: QK of the last tile, masked past its tail valid keys,
     # with PV of the tile before it. V's last tile goes to slot 1.
     k_final_a, k_final_b = ka[0], kb[0]
@@ -687,6 +894,7 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
         v_n1,
         ks_n1,
         tail,
+        CALLER_WAITS=PIPELINED,
     )
     # V's last tile, in slot 1.
     tlx.async_load_wait_group(0)
@@ -1118,11 +1326,14 @@ def forward_prequantized(
     sm_scale,
     *,
     fast_exp=None,
+    block_m=_BLOCK_M,
 ):
     """Return output and natural-log LSE from prepared MXFP8 inputs.
 
     ``q_state`` and ``kv_state`` are what ``prepare_q`` and ``prepare_kv``
-    returned for these offset tensors. ``fast_exp`` is as in ``forward``."""
+    returned for these offset tensors. ``fast_exp`` and ``block_m`` are as in
+    ``forward``."""
+    _check_block_m(block_m)
     q8, q_scales = q_state
     k8, k_scales, v8, v_scales = kv_state
     device = q8.device
@@ -1134,7 +1345,7 @@ def forward_prequantized(
     _check_state(kv_state, "KV", cu_seqlens_k, kv_state.rows)
     if not math.isfinite(sm_scale):
         raise ValueError("sm_scale must be finite")
-    meta = _metadata(cu_seqlens_q, cu_seqlens_k, q8.shape[0], kv_state.rows, _BLOCK_M)
+    meta = _metadata(cu_seqlens_q, cu_seqlens_k, q8.shape[0], kv_state.rows, block_m)
     return _launch_extended_forward(
         q8,
         q_scales,
@@ -1149,7 +1360,13 @@ def forward_prequantized(
         kv_state.rows,
         fast_exp,
         True,
+        block_m,
     )
+
+
+def _check_block_m(block_m):
+    if block_m not in _BLOCK_MS:
+        raise ValueError("block_m must be 128 or 256")
 
 
 def _check(q, k, v, sm_scale, kv_contiguous=True):
@@ -1173,22 +1390,27 @@ def forward(
     *,
     fast_exp=None,
     kv_state=None,
+    block_m=_BLOCK_M,
 ):
     """Return (out, lse, kv_state); lse is natural-log FP32 [4, total_q].
 
-    Query tiles have 128 rows on four warps. ``fast_exp`` selects the
-    approximate exponential; left as None, it is used when the sequences
-    average at least 4096 keys. Sequences with no keys get zero
+    Query tiles have ``block_m`` rows: 128 on four waves (the default), or
+    256 on eight, which is faster when the query lengths are close to
+    multiples of 256 and slower when 256-row tiles would be mostly padding.
+    The results and the K/V state are the same for both. ``fast_exp``
+    selects the approximate exponential; left as None, it is used when the
+    sequences average at least 4096 keys. Sequences with no keys get zero
     output rows and -inf LSE. A ``kv_state`` from ``prepare_kv`` is only
     accepted with the key-offset tensor it was prepared from, unchanged
     since."""
     # With a given kv_state, K and V only supply their shape.
     _check(q, k, v, sm_scale, kv_contiguous=kv_state is None)
+    _check_block_m(block_m)
     _check_offsets(cu_seqlens_q, q.device)
     _check_offsets(cu_seqlens_k, q.device)
     if cu_seqlens_q.shape != cu_seqlens_k.shape:
         raise ValueError("Query and key sequence offsets must have the same shape")
-    meta = _metadata(cu_seqlens_q, cu_seqlens_k, q.shape[0], k.shape[0], _BLOCK_M)
+    meta = _metadata(cu_seqlens_q, cu_seqlens_k, q.shape[0], k.shape[0], block_m)
     if kv_state is None:
         kv_state = prepare_kv(k, v, cu_seqlens_k, meta)
     else:
@@ -1208,6 +1430,7 @@ def forward(
         k.shape[0],
         fast_exp,
         False,
+        block_m,
     )
     return out, lse, kv_state
 
@@ -1223,6 +1446,7 @@ def flash_attn_varlen_mxfp8(
     sm_scale,
     *,
     fast_exp=None,
+    block_m=_BLOCK_M,
 ):
     """Catalog entry point of ``tlx.ops.flash_attn_varlen_mxfp8``: ``forward``'s
     output alone. The maximum lengths are unused."""
@@ -1236,6 +1460,7 @@ def flash_attn_varlen_mxfp8(
         cu_seqlens_k,
         sm_scale,
         fast_exp=fast_exp,
+        block_m=block_m,
     )
     return out
 
@@ -1254,9 +1479,11 @@ def _launch_extended_forward(
     total_kv,
     fast_exp,
     prequantized,
+    block_m,
 ):
     """Launch the attention kernel. Returns (out, lse). ``q`` is BF16, or E4M3
     with ``q_scales`` when ``prequantized``."""
+    eight_waves = block_m == 256
     batch = cu_seqlens_k.numel() - 1
     out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
     lse = torch.empty((_HEADS, q.shape[0]), dtype=torch.float32, device=q.device)
@@ -1271,8 +1498,11 @@ def _launch_extended_forward(
         q_scales if q_scales is not None else q,
         k8,
         v8,
-        ks,
-        vs,
+        # Eight waves get int32 views of the packed E8M0 scale words: behind
+        # the kernel's pointer cast their copies are not buffer loads, which
+        # costs 14% on short K/V. Four waves measure the same either way.
+        ks.view(torch.int32) if eight_waves else ks,
+        vs.view(torch.int32) if eight_waves else vs,
         out,
         lse,
         cu_seqlens_q,
@@ -1285,9 +1515,9 @@ def _launch_extended_forward(
         meta["npad"],
         sm_scale * _LOG2E,
         HEADS=_HEADS,
-        BLOCK_M=_BLOCK_M,
+        BLOCK_M=block_m,
         FAST_EXP=fast_exp,
         PREQUANTIZED_Q=prequantized,
-        **_LAUNCH_OPTIONS,
+        **{**_LAUNCH_OPTIONS, "num_warps": block_m // 32},
     )
     return out, lse
