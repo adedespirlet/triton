@@ -53,9 +53,7 @@ from . import mxfp8_attention_core_gfx950 as core
 
 _HEADS = 4
 _HEAD_DIM = 128
-# Query-tile rows per work item, one wave per 32: 128 selects the 4-wave
-# kernel, the default, and 256 the 8-wave one.
-_BLOCK_MS = (128, 256)
+_SUPPORTED_BLOCK_MS = (128, 256)
 _BLOCK_M = 128
 # Sequences averaging at least this many keys are long: the approximate
 # exponential is then the default.
@@ -1365,7 +1363,7 @@ def forward_prequantized(
 
 
 def _check_block_m(block_m):
-    if block_m not in _BLOCK_MS:
+    if block_m not in _SUPPORTED_BLOCK_MS:
         raise ValueError("block_m must be 128 or 256")
 
 
